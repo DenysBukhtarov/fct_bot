@@ -246,8 +246,22 @@ def main():
     # Антиспам — перевіряє всі інші текстові повідомлення в групі
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, anti_spam))
 
-    logger.info("Бот запущено. Натисніть Ctrl+C для зупинки.")
-    app.run_polling()
+    webhook_url = os.getenv("WEBHOOK_URL")  # напр. https://fct-bot.onrender.com
+
+    if webhook_url:
+        # Режим webhook — використовується на Render (Web Service).
+        port = int(os.getenv("PORT", 8080))
+        logger.info("Бот запущено у режимі webhook: %s", webhook_url)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=BOT_TOKEN,  # токен у шляху — щоб адресу вебхука не вгадали сторонні
+            webhook_url=f"{webhook_url}/{BOT_TOKEN}",
+        )
+    else:
+        # Режим polling — для локального запуску без публічної адреси.
+        logger.info("Бот запущено у режимі polling. Натисніть Ctrl+C для зупинки.")
+        app.run_polling()
 
 
 if __name__ == "__main__":
