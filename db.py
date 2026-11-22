@@ -24,6 +24,10 @@ CREATE TABLE IF NOT EXISTS fct_users (
     blocked    BOOLEAN NOT NULL DEFAULT false
 );
 
+ALTER TABLE fct_users ADD COLUMN IF NOT EXISTS consent_at TIMESTAMPTZ;
+ALTER TABLE fct_users ADD COLUMN IF NOT EXISTS consent_version TEXT;
+ALTER TABLE fct_users ADD COLUMN IF NOT EXISTS news_off BOOLEAN NOT NULL DEFAULT false;
+
 CREATE TABLE IF NOT EXISTS fct_groups (
     chat_id  BIGINT PRIMARY KEY,
     title    TEXT,
@@ -92,6 +96,14 @@ CREATE TABLE IF NOT EXISTS fct_settings (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS fct_warnings (
+    chat_id    BIGINT      NOT NULL,
+    user_id    BIGINT      NOT NULL,
+    count      INTEGER     NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (chat_id, user_id)
 );
 
 CREATE TABLE IF NOT EXISTS fct_kv (
@@ -184,8 +196,93 @@ async def set_blocked(user_id: int):
 
 
 async def active_user_ids():
-    rows = await _fetch("SELECT user_id FROM fct_users WHERE NOT blocked ORDER BY user_id")
+    """Отримувачі розсилки: не заблокували бота і не відмовились від розсилок."""
+    rows = await _fetch("SELECT user_id FROM fct_users WHERE NOT blocked AND NOT news_off ORDER BY user_id")
     return [r["user_id"] for r in rows]
+
+
+# ---------- Згода й права клієнта (Закон «Про захист персональних даних») ----------
+
+async def consent_version(user_id: int):
+    row = await _fetch("SELECT consent_version FROM fct_users WHERE user_id = %s", (user_id,), one=True)
+    return row["consent_version"] if row else None
+
+
+async def set_consent(u, version: str):
+    await _exec(
+        """
+        INSERT INTO fct_users (user_id, first_name, last_name, username, consent_at, consent_version)
+        VALUES (%s, %s, %s, %s, now(), %s)
+        ON CONFLICT (user_id) DO UPDATE SET consent_at = now(), consent_version = EXCLUDED.consent_version
+        """,
+        (u.id, u.first_name, u.last_name, u.username, version),
+    )
+
+
+async def set_news_off(user_id: int, off: bool):
+    await _exec("UPDATE fct_users SET news_off = %s WHERE user_id = %s", (off, user_id))
+
+
+async def export_user_data(user_id: int) -> dict:
+    return {
+        "user": await _fetch("SELECT * FROM fct_users WHERE user_id = %s", (user_id,), one=True),
+        "bookings": await _fetch("SELECT * FROM fct_bookings WHERE user_id = %s ORDER BY id", (user_id,)),
+        "payments": await _fetch(
+            "SELECT id, student, status, sub_type, created_at FROM fct_payments WHERE user_id = %s ORDER BY id",
+            (user_id,)),
+        "subscriptions": await _fetch(
+            "SELECT * FROM fct_subscriptions WHERE user_id = %s ORDER BY id", (user_id,)),
+        "birthdays": await _fetch("SELECT * FROM fct_birthdays WHERE user_id = %s ORDER BY id", (user_id,)),
+        "warnings": await _fetch(
+            "SELECT chat_id, count, updated_at FROM fct_warnings WHERE user_id = %s", (user_id,)),
+    }
+
+
+async def delete_user_data(user_id: int) -> dict:
+    """Видаляє всі дані користувача з бази (право на видалення / відкликання згоди)."""
+    counts = {}
+    async with _pool.connection() as conn:
+        async with conn.transaction():
+            for table in ("fct_bookings", "fct_payments", "fct_subscriptions", "fct_birthdays",
+                          "fct_warnings", "fct_users"):
+                cur = await conn.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
+                counts[table] = cur.rowcount
+    return counts
+
+
+async def cleanup(bookings_days: int, payments_days: int, inactive_days: int) -> dict:
+    """Видаляє дані, строк зберігання яких минув (див. config.py, розділ КОНФІДЕНЦІЙНІСТЬ)."""
+    counts = {}
+    async with _pool.connection() as conn:
+        async with conn.transaction():
+            cur = await conn.execute(
+                "DELETE FROM fct_bookings WHERE day < current_date - %s::int", (bookings_days,))
+            counts["bookings"] = cur.rowcount
+            cur = await conn.execute(
+                "DELETE FROM fct_payments WHERE created_at < now() - make_interval(days => %s)",
+                (payments_days,))
+            counts["payments"] = cur.rowcount
+            cur = await conn.execute(
+                "DELETE FROM fct_subscriptions WHERE ends < current_date - %s::int", (payments_days,))
+            counts["subscriptions"] = cur.rowcount
+            # Неактивні користувачі без чинних оплат/абонементів — видаляємо разом з їхніми даними
+            cur = await conn.execute(
+                """
+                SELECT user_id FROM fct_users u
+                WHERE last_seen < now() - make_interval(days => %s)
+                  AND NOT EXISTS (SELECT 1 FROM fct_payments p WHERE p.user_id = u.user_id)
+                  AND NOT EXISTS (SELECT 1 FROM fct_subscriptions s WHERE s.user_id = u.user_id)
+                """,
+                (inactive_days,),
+            )
+            ids = [r[0] for r in await cur.fetchall()]
+            for table in ("fct_bookings", "fct_birthdays", "fct_warnings", "fct_users"):
+                await conn.execute(f"DELETE FROM {table} WHERE user_id = ANY(%s)", (ids,))
+            counts["inactive_users"] = len(ids)
+            cur = await conn.execute(
+                "DELETE FROM fct_kv WHERE created_at < now() - interval '400 days'")
+            counts["kv"] = cur.rowcount
+    return counts
 
 
 async def touch_group(chat_id: int, title: str):

@@ -43,6 +43,7 @@ import admin_tools
 import config
 import db
 import flows
+import privacy
 from common import ADMIN_IDS, MAIN_MENU, MENU_TEXTS, get_text, is_admin, is_owner
 from storage import make_store
 
@@ -100,7 +101,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🥊 Привіт! Я бот {config.BOT_NAME}.\n\n"
         "Тут можна записатись на тренування чи пробне заняття, подивитись розклад і ціни, "
-        "оплатити й перевірити абонемент.\n\nОбери пункт меню нижче 👇",
+        "оплатити й перевірити абонемент.\n\nОбери пункт меню нижче 👇\n\n"
+        "🔒 Як бот працює з даними: /privacy",
         reply_markup=MAIN_MENU,
     )
     if update.effective_chat.type == "private" and is_owner(update.effective_user.id):
@@ -120,7 +122,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎫 /my — мій абонемент і записи\n"
         "🎂 /birthday — вказати день народження (привітаємо в групі)\n"
         "📋 /menu — головне меню\n"
-        "❌ /cancel — скасувати поточну дію",
+        "❌ /cancel — скасувати поточну дію\n\n"
+        "🔒 Ваші дані:\n"
+        "/privacy — політика конфіденційності\n"
+        "/mydata — які дані про вас зберігає бот\n"
+        "/delete_me — видалити свої дані\n"
+        "/news_off — відмовитись від розсилок",
         reply_markup=MAIN_MENU,
     )
 
@@ -408,6 +415,9 @@ USER_COMMANDS = [
     BotCommand("my", "Мій абонемент і записи"),
     BotCommand("birthday", "Вказати день народження"),
     BotCommand("help", "Допомога"),
+    BotCommand("privacy", "Політика конфіденційності"),
+    BotCommand("mydata", "Мої дані в боті"),
+    BotCommand("delete_me", "Видалити мої дані"),
     BotCommand("cancel", "Скасувати дію"),
 ]
 
@@ -441,6 +451,7 @@ def build_app(request=None) -> Application:
     # Діалоги (кожен у своїй групі) і кнопки адміністратора
     flows.register(app)
     admin_tools.register(app)
+    privacy.register(app)
 
     # Група 0: загальні команди й меню
     app.add_handler(CommandHandler("start", start))

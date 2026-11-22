@@ -27,6 +27,7 @@ from telegram.ext import (
 
 import config
 import db
+from privacy import ask_consent, has_consent, save_consent
 from common import (
     CANCEL_KB,
     CANCEL_TEXT,
@@ -49,7 +50,10 @@ logger = logging.getLogger(__name__)
 
 # Стани діалогів
 (DIR, SLOT, DAY, NAME, PHONE, CONFIRM, T_AGE, T_EXP, T_GOAL,
- P_STUDENT, P_PROOF, BD_NAME, BD_DATE) = range(13)
+ P_STUDENT, P_PROOF, BD_NAME, BD_DATE, T_PARENT) = range(14)
+
+# Вік, до якого заявку на пробне має подати один із батьків / законний представник
+PARENT_AGE = 14
 
 PRIVATE = filters.ChatType.PRIVATE
 NOT_MENU = ~filters.Text(MENU_TEXTS + [CANCEL_TEXT]) & ~filters.COMMAND
@@ -148,21 +152,46 @@ async def _start_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, trial:
         await _private_only(update, context, payload, label)
         return ConversationHandler.END
     if not db.enabled():
-        await update.message.reply_text(DB_OFF_TEXT, reply_markup=MAIN_MENU)
+        await update.effective_message.reply_text(DB_OFF_TEXT, reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+    if not await has_consent(update.effective_user.id):
+        await ask_consent(update, "trial" if trial else "book")
         return ConversationHandler.END
 
     begin_flow(context)
     context.user_data["trial"] = trial
     if trial:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "🆓 *Пробне заняття*\n\nКілька коротких питань, щоб тренер підготувався.\n\n"
             "Скільки років учню? Напишіть число.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=CANCEL_KB,
         )
         return T_AGE
-    await update.message.reply_text("📝 Запис на тренування", reply_markup=CANCEL_KB)
-    return await _ask_direction(update.message)
+    await update.effective_message.reply_text("📝 Запис на тренування", reply_markup=CANCEL_KB)
+    return await _ask_direction(update.effective_message)
+
+
+async def consent_then_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Натиснули «Погоджуюсь» — зберігаємо згоду і запускаємо той діалог, з якого прийшли."""
+    q = update.callback_query
+    if not q.data:
+        return ConversationHandler.END
+    await q.answer("Дякуємо!")
+    await save_consent(update)
+    try:
+        await q.edit_message_reply_markup(None)
+    except Exception:
+        pass
+    await q.message.reply_text("✅ Згоду збережено. Продовжуємо 👇")
+    flow = q.data.split(":", 1)[1]
+    if flow in ("book", "trial"):
+        return await _start_flow(update, context, trial=(flow == "trial"))
+    if flow == "pay":
+        return await pay_start(update, context)
+    if flow == "bday":
+        return await birthday_start(update, context)
+    return ConversationHandler.END
 
 
 async def trial_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -171,9 +200,40 @@ async def trial_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Напишіть, будь ласка, вік числом, наприклад: 12")
         return T_AGE
     context.user_data["age"] = int(digits)
+    if int(digits) < PARENT_AGE:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Так, я один із батьків / законний представник", callback_data="tpar:yes")],
+            [InlineKeyboardButton("Ні", callback_data="tpar:no")],
+        ])
+        await update.message.reply_text(
+            f"Учню менше {PARENT_AGE} років. Заявку й дані дитини має надати один із батьків "
+            "або інший законний представник. Це ви?",
+            reply_markup=kb,
+        )
+        return T_PARENT
+    return await _ask_experience(update.message)
+
+
+async def _ask_experience(message):
     kb = [[InlineKeyboardButton(x, callback_data=f"texp:{i}")] for i, x in enumerate(config.TRIAL_EXPERIENCE)]
-    await update.message.reply_text("Чи був досвід тренувань?", reply_markup=InlineKeyboardMarkup(kb))
+    await message.reply_text("Чи був досвід тренувань?", reply_markup=InlineKeyboardMarkup(kb))
     return T_EXP
+
+
+async def trial_parent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data == "tpar:yes":
+        context.user_data["parent_confirmed"] = True
+        await q.edit_message_text("✅ Заявку подає один із батьків / законний представник.")
+        return await _ask_experience(q.message)
+    context.user_data.clear()
+    await q.edit_message_text(
+        f"Зрозуміло. Для дитини до {PARENT_AGE} років заявку має подати один із батьків — "
+        "попросіть, будь ласка, їх записати дитину через цього бота або написати тренеру @Denis_Bukhtarov."
+    )
+    await q.message.reply_text("Головне меню 👇", reply_markup=MAIN_MENU)
+    return ConversationHandler.END
 
 
 async def trial_exp(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -450,9 +510,11 @@ def booking_conversation() -> ConversationHandler:
             CommandHandler("trial", trial_start),
             MessageHandler(PRIVATE & filters.Regex(r"^/start book$"), book_start),
             MessageHandler(PRIVATE & filters.Regex(r"^/start trial$"), trial_start),
+            CallbackQueryHandler(consent_then_start, pattern=r"^consent:(book|trial)$"),
         ],
         states={
             T_AGE: [MessageHandler(PRIVATE & NOT_MENU & filters.TEXT, trial_age)],
+            T_PARENT: [CallbackQueryHandler(trial_parent, pattern=r"^tpar:(yes|no)$")],
             T_EXP: [CallbackQueryHandler(trial_exp, pattern=r"^texp:\d+$")],
             T_GOAL: [CallbackQueryHandler(trial_goal, pattern=r"^tgoal:\d+$")],
             DIR: [CallbackQueryHandler(pick_direction, pattern=r"^bdir:")],
@@ -482,12 +544,18 @@ def booking_conversation() -> ConversationHandler:
 async def pay_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if update.callback_query:
-        await update.callback_query.answer()
+        try:
+            await update.callback_query.answer()
+        except Exception:
+            pass  # уже відповіли (наприклад, після «Погоджуюсь»)
     if update.effective_chat.type != "private":
         await _private_only(update, context, "pay", "✅ Надіслати квитанцію")
         return ConversationHandler.END
     if not db.enabled():
         await message.reply_text(DB_OFF_TEXT, reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+    if not await has_consent(update.effective_user.id):
+        await ask_consent(update, "pay")
         return ConversationHandler.END
     begin_flow(context)
     suggestions = []
@@ -632,6 +700,7 @@ def payment_conversation() -> ConversationHandler:
             CommandHandler("paid", pay_start),
             CallbackQueryHandler(pay_start, pattern=r"^menu:pay$"),
             MessageHandler(PRIVATE & filters.Regex(r"^/start pay$"), pay_start),
+            CallbackQueryHandler(consent_then_start, pattern=r"^consent:pay$"),
         ],
         states={
             P_STUDENT: [MessageHandler(PRIVATE & NOT_MENU & filters.TEXT, pay_student)],
@@ -707,14 +776,17 @@ async def birthday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _private_only(update, context, "birthday", "🎂 Вказати день народження")
         return ConversationHandler.END
     if not db.enabled():
-        await update.message.reply_text(DB_OFF_TEXT)
+        await update.effective_message.reply_text(DB_OFF_TEXT)
+        return ConversationHandler.END
+    if not await has_consent(update.effective_user.id):
+        await ask_consent(update, "bday")
         return ConversationHandler.END
     begin_flow(context)
     existing = await db.user_birthdays(update.effective_user.id)
     if existing:
         rows = [[InlineKeyboardButton(f"🗑 {b['name']} — {b['day']:02d}.{b['month']:02d}",
                                       callback_data=f"bdel:{b['id']}")] for b in existing]
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "🎂 Збережені дні народження (натисніть, щоб видалити):",
             reply_markup=InlineKeyboardMarkup(rows),
         )
@@ -725,8 +797,9 @@ async def birthday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.first_name and update.effective_user.first_name not in suggestions:
         suggestions.append(update.effective_user.first_name)
     kb = ReplyKeyboardMarkup([[s] for s in suggestions[:2]] + [[CANCEL_TEXT]], resize_keyboard=True)
-    await update.message.reply_text(
-        "🎂 Бот привітає в групі клубу в день народження.\n\nЧий день народження? Напишіть ім'я.",
+    await update.effective_message.reply_text(
+        "🎂 Бот привітає в групі клубу в день народження — ім'я і привітання побачать учасники групи. "
+        "Зберігаються лише ім'я, день і місяць (без року).\n\nЧий день народження? Напишіть ім'я.",
         reply_markup=kb,
     )
     return BD_NAME
@@ -789,6 +862,7 @@ def birthday_conversation() -> ConversationHandler:
         entry_points=[
             CommandHandler("birthday", birthday_start),
             MessageHandler(PRIVATE & filters.Regex(r"^/start birthday$"), birthday_start),
+            CallbackQueryHandler(consent_then_start, pattern=r"^consent:bday$"),
         ],
         states={
             BD_NAME: [MessageHandler(PRIVATE & NOT_MENU & filters.TEXT, birthday_name)],

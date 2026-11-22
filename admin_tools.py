@@ -539,6 +539,15 @@ async def tick(app) -> dict:
                     await send_user(bot, b["user_id"], text)
                     done["birthdays"] += 1
 
+        # 6) Раз на добу — видалення даних, строк зберігання яких минув
+        if await db.once(f"cleanup:{today.isoformat()}"):
+            try:
+                removed = await db.cleanup(config.KEEP_BOOKINGS_DAYS, config.KEEP_PAYMENTS_DAYS,
+                                           config.KEEP_INACTIVE_USER_DAYS)
+                done["cleanup"] = sum(removed.values())
+            except Exception as e:
+                logger.error("Не вдалось очистити старі дані: %s", e)
+
         if any(v for v in done.values()):
             logger.info("Нагадування: %s", done)
         return done

@@ -102,7 +102,7 @@ async def is_admin(context, chat_id, user_id: int) -> bool:
 async def notify_admins(bot, text: str, reply_markup=None, photo=None, document=None) -> int:
     """Надсилає повідомлення всім ADMIN_IDS. Повертає, скільком вдалося."""
     if not ADMIN_IDS:
-        logger.warning("ADMIN_IDS не задано — сповіщення адміну нікуди надіслати: %s", text[:80])
+        logger.warning("ADMIN_IDS не задано — сповіщення адміну нікуди надіслати.")
         return 0
     sent = 0
     for admin_id in ADMIN_IDS:
