@@ -3,7 +3,7 @@
 FCT Assistant Bot — Telegram-бот для групи спортивного залу.
 
 Функції:
-  - Головне меню з кнопками (розклад, ціни, напрямки, запис, контакти...)
+  - Головне меню з кнопками (розклад, ціни, реквізити, напрямки, запис, контакти...)
   - Автоматичне привітання нових учасників
   - Правила групи по команді
   - Базовий антиспам у групах (видалення посилань від не-адмінів + попередження)
@@ -69,10 +69,11 @@ ADMIN_CACHE_SECONDS = 600
 # ---------- Кнопки головного меню ----------
 MENU_BUTTONS = [
     ["📅 Розклад", "📝 Записатися"],
-    ["💳 Вартість", "🥊 Напрямки"],
-    ["👨‍🏫 Тренери", "📍 Адреса"],
+    ["💳 Вартість", "🧾 Реквізити"],
+    ["🥊 Напрямки", "👨‍🏫 Тренери"],
+    ["📍 Адреса", "📞 Зв'язок"],
     ["🌐 Сайт", "📸 Instagram"],
-    ["📞 Зв'язок", "📜 Правила"],
+    ["📜 Правила"],
 ]
 MAIN_MENU = ReplyKeyboardMarkup(MENU_BUTTONS, resize_keyboard=True)
 MENU_TEXTS = [t for row in MENU_BUTTONS for t in row]
@@ -138,6 +139,16 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "📜 Правила": config.RULES_TEXT,
     }
 
+    if text == "🧾 Реквізити":
+        payment = getattr(config, "PAYMENT_TEXT", "")
+        if not payment or "[" in payment:
+            # Реквізити ще не заповнені в config.py
+            await update.message.reply_text(
+                "🧾 Реквізити для оплати уточнюйте в адміністратора: @Denis_Bukhtarov"
+            )
+            return
+        await update.message.reply_text(payment, parse_mode=ParseMode.MARKDOWN)
+        return
     if text == "🌐 Сайт":
         await update.message.reply_text(f"🌐 {config.WEBSITE_URL}")
         return
