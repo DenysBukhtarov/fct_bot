@@ -7,7 +7,8 @@ FCT Assistant Bot — Telegram-бот для групи спортивного �
   - Автоматичне привітання нових учасників
   - Правила групи по команді
   - Базовий антиспам у групах (видалення посилань від не-адмінів + попередження)
-  - Адмін-команди: /warn, /unwarn, /stats, /myid
+  - Адмін-команди: /warn, /unwarn, /warns, /stats, /myid
+  - Попередження зберігаються в базі (DATABASE_URL), якщо її задано
 
 Запуск: python bot.py
 Токен читається зі змінної середовища BOT_TOKEN (файл .env або Environment на Render).
@@ -17,7 +18,6 @@ import hashlib
 import logging
 import os
 import time
-from collections import defaultdict
 
 from dotenv import load_dotenv
 from telegram import ReplyKeyboardMarkup, Update
@@ -32,6 +32,7 @@ from telegram.ext import (
 from telegram.helpers import escape_markdown
 
 import config
+from storage import make_store
 
 # ---------- Налаштування логування ----------
 logging.basicConfig(
@@ -58,8 +59,8 @@ def _env_admin_ids() -> set[int]:
 
 ADMIN_IDS = set(config.ADMIN_IDS) | _env_admin_ids()
 
-# ---------- Пам'ять попереджень (в оперативній пам'яті; при перезапуску скидається) ----------
-warnings_count: dict[int, int] = defaultdict(int)
+# ---------- Сховище попереджень (база даних або пам'ять) ----------
+store = make_store()
 
 # Кеш адміністраторів груп: chat_id -> (час, {user_id})
 _group_admins: dict[int, tuple[float, set[int]]] = {}
@@ -207,8 +208,7 @@ async def anti_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = message.from_user
-    warnings_count[user.id] += 1
-    count = warnings_count[user.id]
+    count = await store.add(message.chat_id, user.id, 1)
 
     await context.bot.send_message(
         chat_id=message.chat_id,
@@ -227,7 +227,7 @@ async def anti_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=f"🚫 {user.mention_html()} заблокований за повторний спам.",
                 parse_mode=ParseMode.HTML,
             )
-            warnings_count[user.id] = 0
+            await store.reset(message.chat_id, user.id)
         except Exception as e:
             logger.warning("Не вдалось заблокувати користувача: %s", e)
 
@@ -248,8 +248,7 @@ async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Адміністраторам і ботам попередження не видаються.")
         return
 
-    warnings_count[target.id] += 1
-    count = warnings_count[target.id]
+    count = await store.add(msg.chat_id, target.id, 1)
     await msg.reply_text(
         f"⚠️ {target.mention_html()} отримав попередження ({count}/{config.MAX_WARNINGS}).",
         parse_mode=ParseMode.HTML,
@@ -259,7 +258,7 @@ async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.ban_chat_member(chat_id=msg.chat_id, user_id=target.id)
             await msg.reply_text(f"🚫 {target.mention_html()} заблокований.", parse_mode=ParseMode.HTML)
-            warnings_count[target.id] = 0
+            await store.reset(msg.chat_id, target.id)
         except Exception as e:
             logger.warning("Не вдалось заблокувати користувача: %s", e)
 
@@ -273,10 +272,25 @@ async def unwarn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     target = msg.reply_to_message.from_user
-    if warnings_count[target.id] > 0:
-        warnings_count[target.id] -= 1
+    count = await store.add(msg.chat_id, target.id, -1)
     await msg.reply_text(
-        f"✅ Знято попередження у {target.mention_html()} (зараз: {warnings_count[target.id]}).",
+        f"✅ Знято попередження у {target.mention_html()} (зараз: {count}).",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def show_warns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/warns у відповідь на повідомлення — скільки попереджень у цього учасника."""
+    msg = update.message
+    if not await is_admin(context, msg.chat_id, msg.from_user.id):
+        return
+    if not msg.reply_to_message or not msg.reply_to_message.from_user:
+        await msg.reply_text("Використайте /warns у відповідь на повідомлення користувача.")
+        return
+    target = msg.reply_to_message.from_user
+    count = await store.get(msg.chat_id, target.id)
+    await msg.reply_text(
+        f"📋 У {target.mention_html()} попереджень: {count}/{config.MAX_WARNINGS}.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -300,8 +314,12 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Точка входу ----------
 
+async def on_startup(app: Application):
+    await store.init()
+
+
 def build_app() -> Application:
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu))
@@ -309,6 +327,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("myid", my_id))
     app.add_handler(CommandHandler("warn", warn_user, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("unwarn", unwarn_user, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("warns", show_warns, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("stats", stats))
 
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
